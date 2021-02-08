@@ -3,10 +3,7 @@ function main() {
 		sudo apt install -y supercollider
 	fi
 
-	if ! grep FoxDot < <(pip freeze) >/dev/null; then
-		python3 -m pip install FoxDot
-	fi
-
+	python3 -m pip install FoxDot janus
 	python3 main.py
 }
 
