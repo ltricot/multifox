@@ -1,94 +1,110 @@
-import asyncio as aio
-from asyncio import subprocess as sp
-import json
-import ssl
-
 import socketio
 
+from asyncio import subprocess as sp
+import asyncio as aio
 
-URI = 'wss://wsfoxdot-nm5dxx2vwq-ey.a.run.app'
-# URI = 'ws://localhost:3000'
 
-async def sclang():
-    proc = await sp.create_subprocess_shell(
-        'sclang',
-        stdin=sp.PIPE,
-        stdout=sp.PIPE,
-        stderr=sp.PIPE,
-    )
+async def getblock(stream):
+    lines = []
+    while (line := await stream.readline()):
+        lines.append(line)
+        if line == b'\n':
+            return b''.join(lines)
 
-    # start foxdot sc extension (udp server)
-    proc.stdin.write(b'Quarks.install("FoxDot");\n\x0c')
-    proc.stdin.write(b'FoxDot.start();\n\x0c')
-    await proc.stdin.drain()
+    return b''
 
-    async def _():  # rid the world of garbage
-        while (bts := await proc.stdout.readline()):
-            # print(bts.decode().strip())
-            ...
+class Client:
+    def __init__(self):
+        # for documentation purposes
+        self.sc = None
+        self.fd = None
+        self.r, self.w = None, None
 
-    aio.create_task(_())
+    async def sclang(self):
+        self.sc = proc = await sp.create_subprocess_shell(
+            'sclang',
+            stdin=sp.PIPE,
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+        )
 
-    return proc
+        # start foxdot sc extension (udp server)
+        proc.stdin.write(b'Quarks.install("FoxDot");\n\x0c')
+        proc.stdin.write(b'FoxDot.start();\n\x0c')
+        await proc.stdin.drain()
 
-async def foxdot():
-    global pfoxdot
+        async def _(stream):  # rid the world of garbage
+            while (bts := await stream.readline()):
+                ...
 
-    # provides no stdout
-    proc = await sp.create_subprocess_shell(
-        'python -m FoxDot --pipe',
-        stdin=sp.PIPE,
-    )
+        aio.create_task(_(proc.stdout))
+        aio.create_task(_(proc.stderr))
 
-    return proc
+    async def foxdot(self):
+        # provides no stdout
+        self.fd = proc = await sp.create_subprocess_shell(
+            'python -m FoxDot --pipe',
+            stdin=sp.PIPE,
+            stderr=sp.PIPE,
+        )
 
-async def repl(sio):
-    async def handler(reader, writer):
+        async def _():  # rid the world of garbage
+            while (bts := await proc.stderr.readline()):
+                ...
+
+        aio.create_task(_())
+
+    async def sock2ws(self, sio):
         while True:
-            lines = []
-            while True:
-                line = await reader.readline()
+            code = (await getblock(self.r)).decode()
+            if not code:
+                return
 
-                if not line:
-                    return
-
-                if line == b'\n':
-                    break
-
-                lines.append(line)
-
-            code = b'\n'.join(l.rstrip(b'\n') for l in lines).decode()
+            code = code.rstrip('\n') + 2 * '\n'
             print(code)
+            await sio.emit('code', {'code': code})
+            print('sent')
 
-            await sio.emit('code', {"code": code})
+    async def ws2sock(self, sio):
+        @sio.on('code')
+        async def _(msg):
+            print(msg)
+            code = msg['code'].rstrip('\n') + 2 * '\n'
+            self.w.write(code.encode())
+            self.fd.stdin.write(code.encode())
+            await self.w.drain()
+            await self.fd.stdin.drain()
 
-    await aio.start_unix_server(handler, path='/tmp/foxdot.sock')
+    async def serve(self, reader, writer):
+        self.r, self.w = reader, writer
 
-async def main():
-    sc = await sclang()
-    await aio.sleep(5)
-    fox = await foxdot()
+        # connect to remote synth authority
+        uri = 'wss://wsfoxdot-nm5dxx2vwq-ey.a.run.app'
+        sio = socketio.AsyncClient()
+        await sio.connect(uri)
 
-    sio = socketio.AsyncClient()
-    await sio.connect(URI)
+        tasks = [
+            aio.create_task(self.sock2ws(sio)),
+            aio.create_task(self.ws2sock(sio)),  # do it for the symmetry
+        ]
 
-    @sio.on('code')
-    async def doeval(msg):
-        code = msg['code']
-        fox.stdin.write(code.encode() + b'\n' * 3)
-        await fox.stdin.drain()
+        await aio.wait(tasks)
 
-    trepl = aio.create_task(repl(sio))
-    teval = aio.create_task(doeval(sio))
+    async def main(self):
+        # start synth interpreter
+        await self.sclang()
+        await aio.sleep(5)  # give sc a bit of time
+        await self.foxdot()
 
-    try:
-        await aio.sleep(3600)
-    except KeyboardInterrupt:
-        await trepl.cancel()
-        await teval.cancel()
-        await sio.disconnect()
-    finally:
-        return
+        # launch local server for vim plugin
+        await aio.start_unix_server(self.serve, path='/tmp/foxdot.sock')
+
+        try:
+            while True:
+                await aio.sleep(3600)
+        finally:
+            return
 
 
-aio.run(main())
+if __name__ == '__main__':
+    aio.run(Client().main())
